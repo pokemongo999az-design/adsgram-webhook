@@ -1,73 +1,92 @@
-import os, hmac, hashlib, logging, requests
-from flask import Flask, request, jsonify
+import telebot
+from telebot import types
+from PIL import Image, ImageDraw, ImageFont
+import os
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+# === CONFIG ===
+API_TOKEN = "8230805944:AAEpj5ZC2ZRokTkmwcBbXps5_VTOvftuhoY"
+BACKGROUND_IMAGE = "background_game.png"  # ton image de base
+FONT_PATH = "arial.ttf"  # Mets ici la police que tu veux utiliser
+OUTPUT_IMAGE = "game_screen.png"
 
-# === Config via variables d’environnement ===
-ADSGRAM_SECRET = os.environ.get("ADSGRAM_SECRET", "").encode()  # <— à mettre sur Render
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")   # optionnel: pour prévenir l’utilisateur
-# (facultatif) URL de l’API Telegram
-TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else None
+REWARD_PER_AD = 0.000181818182
 
-# Petit ping pour tester le déploiement
-@app.get("/ping")
-def ping():
-    return "pong", 200
+bot = telebot.TeleBot(API_TOKEN)
 
-def verify_signature(raw_body: bytes, signature: str) -> bool:
-    """
-    Vérifie la signature HMAC envoyée par AdsGram.
-    On suppose l’en-tête: X-Adsgram-Signature avec hex digest sha256.
-    """
-    if not ADSGRAM_SECRET:
-        app.logger.error("ADSGRAM_SECRET manquant !")
-        return False
-    expected = hmac.new(ADSGRAM_SECRET, raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature or "")
+# stockage utilisateurs
+user_data = {}
 
-def notify_user(chat_id: int, text: str):
-    """Optionnel: envoie un message Telegram à l’utilisateur (si TELEGRAM_BOT_TOKEN est défini)."""
-    if not TG_API or not chat_id:
-        return
-    try:
-        requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
-    except Exception as e:
-        app.logger.warning(f"Impossible d’envoyer le message Telegram: {e}")
+# === Générateur d’image ===
+def generate_game_image(user_id):
+    total = user_data.get(user_id, 0.0)
 
-@app.post("/adsgram/callback")
-def adsgram_callback():
-    """
-    Endpoint appelé par AdsGram après une pub vue.
-    Attendus (exemple): userId, reward, adId, meta (où tu peux mettre ton chat_id).
-    La signature est dans l’en-tête X-Adsgram-Signature.
-    """
-    signature = request.headers.get("X-Adsgram-Signature", "")
-    raw = request.get_data()  # corps brut pour HMAC
-    if not verify_signature(raw, signature):
-        return jsonify({"error": "invalid signature"}), 403
+    # Ouvre le fond
+    img = Image.open(BACKGROUND_IMAGE).convert("RGBA")
+    draw = ImageDraw.Draw(img)
 
-    data = request.get_json(silent=True) or {}
-    user_id = data.get("userId")               # identifiant côté AdsGram
-    reward = float(data.get("reward", 0))
-    ad_id  = data.get("adId")
-    meta   = data.get("meta")  # champ libre: tu peux y passer le chat_id Telegram, etc.
+    # Police
+    font = ImageFont.truetype(FONT_PATH, 60)
 
-    app.logger.info(f"✅ Callback AdsGram OK | userId={user_id} reward={reward} adId={ad_id} meta={meta}")
+    # Texte solde TON
+    text = f"{total:.8f} TON"
+    tw, th = draw.textbbox((0, 0), text, font=font)[2:]
+    x = (img.width - tw) // 2
+    y = img.height - th - 50
+    draw.text((x-2, y-2), text, font=font, fill="black")
+    draw.text((x+2, y-2), text, font=font, fill="black")
+    draw.text((x-2, y+2), text, font=font, fill="black")
+    draw.text((x+2, y+2), text, font=font, fill="black")
+    draw.text((x, y), text, font=font, fill="white")
 
-    # 👉 Ici: crédite TON dans ta base (Postgres conseillé sur Render).
-    # Ex: update_balance(user_id, reward)
+    img.save(OUTPUT_IMAGE)
+    return OUTPUT_IMAGE
 
-    # Option (facile): si tu as généré la pub en incluant chat_id dans meta, tu peux prévenir l’utilisateur :
-    chat_id = None
-    if isinstance(meta, dict):
-        chat_id = meta.get("chat_id")
-    if chat_id:
-        notify_user(chat_id, f"👏 Pub validée ! Récompense : +{reward:.2f} TON")
+# === Générateur de menu ===
+def main_menu():
+    markup = types.InlineKeyboardMarkup()
+    btn1 = types.InlineKeyboardButton("📺 Miner", callback_data="watch_ad")
+    btn2 = types.InlineKeyboardButton("💰 Solde", callback_data="balance")
+    btn3 = types.InlineKeyboardButton("💸 Retrait", callback_data="withdraw")
+    markup.add(btn1)
+    markup.add(btn2, btn3)
+    return markup
 
-    return jsonify({"status": "ok"}), 200
+# === Commande /start ===
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    if user_id not in user_data:
+        user_data[user_id] = 0.0
+    bot.send_message(message.chat.id, "👋 Bienvenue dans le mineur TON !", reply_markup=main_menu())
+    send_game_screen(message.chat.id, user_id)
 
-if __name__ == "__main__":
-    # En local: Flask sur le port 5000 (Render fournira $PORT en prod)
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# === Callback pub ===
+@bot.callback_query_handler(func=lambda call: call.data == "watch_ad")
+def callback_watch_ad(call):
+    user_id = call.from_user.id
+    user_data[user_id] = user_data.get(user_id, 0.0) + REWARD_PER_AD
+    bot.answer_callback_query(call.id, "✅ Pub vue ! Récompense ajoutée.")
+    send_game_screen(call.message.chat.id, user_id)
+
+# === Callback solde ===
+@bot.callback_query_handler(func=lambda call: call.data == "balance")
+def callback_balance(call):
+    user_id = call.from_user.id
+    bot.answer_callback_query(call.id)
+    send_game_screen(call.message.chat.id, user_id)
+
+# === Callback retrait ===
+@bot.callback_query_handler(func=lambda call: call.data == "withdraw")
+def callback_withdraw(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "💸 Fonction de retrait en cours de développement...")
+
+# === Fonction envoi écran de jeu ===
+def send_game_screen(chat_id, user_id):
+    path = generate_game_image(user_id)
+    with open(path, "rb") as img:
+        bot.send_photo(chat_id, img, caption=f"💰 Solde actuel : {user_data[user_id]:.8f} TON", reply_markup=main_menu())
+
+# === Lancement ===
+print("✅ Bot de minage TON démarré...")
+bot.polling(none_stop=True)
