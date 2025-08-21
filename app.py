@@ -1,17 +1,20 @@
 import telebot
 from telebot import types
 from PIL import Image, ImageDraw, ImageFont
+from flask import Flask, request
 import os
 
 # === CONFIG ===
-API_TOKEN = "8230805944:AAEpj5ZC2ZRokTkmwcBbXps5_VTOvftuhoY"
-BACKGROUND_IMAGE = "background_game.png"  # ton image de base
-FONT_PATH = "arial.ttf"  # Mets ici la police que tu veux utiliser
+API_TOKEN = os.getenv("BOT_TOKEN", "TON_TOKEN_ICI")  # sécurise via Render Env Vars
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://ton-app.onrender.com")  # mets ton URL Render
+BACKGROUND_IMAGE = "background_game.png"
+FONT_PATH = "arial.ttf"
 OUTPUT_IMAGE = "game_screen.png"
 
 REWARD_PER_AD = 0.000181818182
 
 bot = telebot.TeleBot(API_TOKEN)
+app = Flask(__name__)
 
 # stockage utilisateurs
 user_data = {}
@@ -19,25 +22,16 @@ user_data = {}
 # === Générateur d’image ===
 def generate_game_image(user_id):
     total = user_data.get(user_id, 0.0)
-
-    # Ouvre le fond
     img = Image.open(BACKGROUND_IMAGE).convert("RGBA")
     draw = ImageDraw.Draw(img)
-
-    # Police
     font = ImageFont.truetype(FONT_PATH, 60)
-
-    # Texte solde TON
     text = f"{total:.8f} TON"
     tw, th = draw.textbbox((0, 0), text, font=font)[2:]
     x = (img.width - tw) // 2
     y = img.height - th - 50
-    draw.text((x-2, y-2), text, font=font, fill="black")
-    draw.text((x+2, y-2), text, font=font, fill="black")
-    draw.text((x-2, y+2), text, font=font, fill="black")
-    draw.text((x+2, y+2), text, font=font, fill="black")
+    for dx, dy in [(-2,-2),(2,-2),(-2,2),(2,2)]:
+        draw.text((x+dx, y+dy), text, font=font, fill="black")
     draw.text((x, y), text, font=font, fill="white")
-
     img.save(OUTPUT_IMAGE)
     return OUTPUT_IMAGE
 
@@ -60,7 +54,7 @@ def start(message):
     bot.send_message(message.chat.id, "👋 Bienvenue dans le mineur TON !", reply_markup=main_menu())
     send_game_screen(message.chat.id, user_id)
 
-# === Callback pub ===
+# === Callbacks ===
 @bot.callback_query_handler(func=lambda call: call.data == "watch_ad")
 def callback_watch_ad(call):
     user_id = call.from_user.id
@@ -68,14 +62,12 @@ def callback_watch_ad(call):
     bot.answer_callback_query(call.id, "✅ Pub vue ! Récompense ajoutée.")
     send_game_screen(call.message.chat.id, user_id)
 
-# === Callback solde ===
 @bot.callback_query_handler(func=lambda call: call.data == "balance")
 def callback_balance(call):
     user_id = call.from_user.id
     bot.answer_callback_query(call.id)
     send_game_screen(call.message.chat.id, user_id)
 
-# === Callback retrait ===
 @bot.callback_query_handler(func=lambda call: call.data == "withdraw")
 def callback_withdraw(call):
     bot.answer_callback_query(call.id)
@@ -87,6 +79,21 @@ def send_game_screen(chat_id, user_id):
     with open(path, "rb") as img:
         bot.send_photo(chat_id, img, caption=f"💰 Solde actuel : {user_data[user_id]:.8f} TON", reply_markup=main_menu())
 
+# === Flask webhook routes ===
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot en ligne 🚀"
+
+@app.route("/", methods=["POST"])
+def webhook():
+    json_str = request.stream.read().decode("utf-8")
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return "ok", 200
+
 # === Lancement ===
-print("✅ Bot de minage TON démarré...")
-bot.polling(none_stop=True)
+if __name__ == "__main__":
+    # Définir webhook à chaque redémarrage
+    bot.remove_webhook()
+    bot.set_webhook(url=WEBHOOK_URL)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
